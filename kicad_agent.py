@@ -129,17 +129,6 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all domains
 
 
-@app.errorhandler(Exception)
-def handle_exception(e):
-    # Optionally log the error here
-    import traceback
-    print(traceback.format_exc())
-    response = {
-        "error": str(e)
-    }
-    return jsonify(response), 500
-
-
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()

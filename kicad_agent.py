@@ -1,196 +1,109 @@
 import os
-import tempfile
-import json
+import requests
+import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import openai
-import requests
-import sexpdata  # pip install sexpdata
-import logging  # Add logging
+import sexpdata
 
-# --- Logging setup ---
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Use the new OpenAI API client
+client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+app = Flask(__name__)
+CORS(app)
 
-
-
-
-# --- KiCad Schematic Parser Implementation ---
-def parse_kicad_schematic(file_path):
-    """
-    Parses a KiCad .kicad_sch file and extracts components and nets.
-    Returns a dict with 'components' and 'nets'.
-    """
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    try:
-        sexp = sexpdata.loads(content)
-    except Exception as e:
-        return {"error": f"Failed to parse schematic: {e}"}
-
+def parse_kicad_schematic(s_expr):
+    """Parse a KiCad schematic S-expression and extract title, components, and nets."""
+    title = None
     components = []
     nets = []
-
-    def find_items(sexp, key):
-        """Recursively find all lists starting with key."""
-        found = []
-        if isinstance(sexp, list):
-            if sexp and isinstance(sexp[0], sexpdata.Symbol) and sexp[0].value() == key:
-                found.append(sexp)
-            for item in sexp:
-                found.extend(find_items(item, key))
-        return found
-
-    # Extract components (symbols)
-    for symbol in find_items(sexp, "symbol"):
-        ref = None
-        value = None
-        lib_id = None
-        at = None
-        for item in symbol[1:]:
-            if isinstance(item, list) and item:
-                if item[0] == sexpdata.Symbol("reference"):
-                    ref = item[1] if len(item) > 1 else None
-                elif item[0] == sexpdata.Symbol("value"):
-                    value = item[1] if len(item) > 1 else None
-                elif item[0] == sexpdata.Symbol("lib_id"):
-                    lib_id = item[1] if len(item) > 1 else None
-                elif item[0] == sexpdata.Symbol("at"):
-                    at = [float(x) for x in item[1:3]] if len(item) > 2 else None
-        components.append({
-            "reference": ref,
-            "value": value,
-            "lib_id": lib_id,
-            "position": at
-        })
-
-    # Extract nets
-    for net in find_items(sexp, "net"):
-        net_name = None
-        nodes = []
-        for item in net[1:]:
-            if isinstance(item, list) and item:
-                if item[0] == sexpdata.Symbol("name"):
-                    net_name = item[1] if len(item) > 1 else None
-                elif item[0] == sexpdata.Symbol("node"):
-                    node_ref = None
-                    node_pin = None
-                    for nitem in item[1:]:
-                        if isinstance(nitem, list) and nitem:
-                            if nitem[0] == sexpdata.Symbol("ref"):
-                                node_ref = nitem[1]
-                            elif nitem[0] == sexpdata.Symbol("pin"):
-                                node_pin = nitem[1]
-                    if node_ref and node_pin:
-                        nodes.append({"ref": node_ref, "pin": node_pin})
-        nets.append({
-            "name": net_name,
-            "connections": nodes
-        })
-
+    for item in s_expr:
+        if isinstance(item, list):
+            if item and item[0] == sexpdata.Symbol('title'):
+                title = item[1] if len(item) > 1 else None
+            elif item and item[0] == sexpdata.Symbol('comp'):
+                ref = value = footprint = None
+                for sub in item:
+                    if isinstance(sub, list):
+                        if sub and sub[0] == sexpdata.Symbol('ref'):
+                            ref = sub[1]
+                        elif sub and sub[0] == sexpdata.Symbol('value'):
+                            value = sub[1]
+                        elif sub and sub[0] == sexpdata.Symbol('footprint'):
+                            footprint = sub[1]
+                components.append({
+                    "ref": ref,
+                    "value": value,
+                    "footprint": footprint
+                })
+            elif item and item[0] == sexpdata.Symbol('net'):
+                code = name = None
+                for sub in item:
+                    if isinstance(sub, list):
+                        if sub and sub[0] == sexpdata.Symbol('code'):
+                            code = sub[1]
+                        elif sub and sub[0] == sexpdata.Symbol('name'):
+                            name = sub[1]
+                nets.append({
+                    "code": code,
+                    "name": name
+                })
     return {
+        "title": title,
         "components": components,
         "nets": nets
     }
 
-def parse_kicad_schematic_from_github(github_url):
-    """
-    Downloads a KiCad schematic from a GitHub raw URL and parses it.
-    """
-    response = requests.get(github_url)
-    if response.status_code != 200:
-        return {"error": f"Failed to download schematic from {github_url}"}
-    content = response.text
-    # Save to a temp file for parsing
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".sch") as temp:
-        temp.write(content.encode("utf-8"))
-        temp_path = temp.name
-    result = parse_kicad_schematic(temp_path)
-    os.remove(temp_path)
-    return result
-
-# --- OpenAI setup ---
-openai.api_key = os.environ["OPENAI_API_KEY"]
-
-# --- Function schema for OpenAI ---
-function_schema = {
-    "name": "parse_kicad_schematic",
-    "description": "Extract components and connections from a KiCad schematic file from a GitHub URL.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "github_url": {
-                "type": "string",
-                "description": "The raw GitHub URL to the KiCad schematic file"
-            }
-        },
-        "required": ["github_url"]
-    }
-}
-
-# --- Flask app ---
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all domains
-
-
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json()
-    logger.debug(f"Received request data: {data}")  # Log incoming request
-    user_message = data["message"]
-    github_url = data["github_url"]
+    try:
+        data = request.get_json()
+        github_url = data.get("github_url")
+        question = data.get("question")
+        if not github_url or not question:
+            return jsonify({"error": "Missing github_url or question"}), 400
 
-    # Step 1: Initial call with tool enabled
-    logger.info("Calling OpenAI ChatCompletion.create (initial call)")
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": user_message},
-            {"role": "user", "content": f"The schematic is at {github_url}"}
-        ],
-        tools=[{
-            "type": "function",
-            "function": function_schema
-        }],
-        tool_choice="auto"
-    )
-    logger.debug(f"OpenAI initial response: {response}")
+        # Download schematic file from GitHub
+        resp = requests.get(github_url)
+        if resp.status_code != 200:
+            return jsonify({"error": f"Failed to fetch schematic: {resp.status_code}"}), 400
+        schematic_text = resp.text
 
-    # Step 2: If tool call is requested, run your parser and continue
-    tool_calls = response.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
-    logger.debug(f"Tool calls extracted: {tool_calls}")
-    if tool_calls:
-        for tool_call in tool_calls:
-            logger.info(f"Processing tool call: {tool_call}")
-            if tool_call["function"]["name"] == "parse_kicad_schematic":
-                arguments = json.loads(tool_call["function"]["arguments"])
-                logger.debug(f"Arguments for parser: {arguments}")
-                parsed_data = parse_kicad_schematic_from_github(arguments["github_url"])
-                logger.debug(f"Parsed schematic data: {parsed_data}")
-                # Step 3: Continue the conversation with the tool output
-                logger.info("Calling OpenAI ChatCompletion.create (followup)")
-                followup = openai.ChatCompletion.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "user", "content": user_message},
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "parse_kicad_schematic",
-                            "content": json.dumps(parsed_data)
-                        }
-                    ]
-                )
-                logger.debug(f"OpenAI followup response: {followup}")
-                return jsonify({"response": followup["choices"][0]["message"]["content"]})
-    else:
-        logger.info("No tool calls found, returning initial response")
-        return jsonify({"response": response["choices"][0]["message"]["content"]})
+        # Parse schematic S-expression
+        try:
+            s_expr = sexpdata.loads(schematic_text)
+        except Exception as e:
+            return jsonify({"error": f"Failed to parse schematic: {str(e)}"}), 400
 
+        summary = parse_kicad_schematic(s_expr)
+
+        # Prepare OpenAI function call
+        system_prompt = (
+            "You are a helpful assistant for KiCad schematic files. "
+            "You are given a summary of the schematic (title, components, nets). "
+            "Answer the user's question using this information."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Schematic summary: {summary}\n\nQuestion: {question}"}
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-4o",  # or "gpt-3.5-turbo"
+            messages=messages,
+            temperature=0.2,
+            max_tokens=512
+        )
+        answer = response.choices[0].message.content
+
+        return jsonify({"answer": answer})
+
+    except Exception as e:
+        # Log the full traceback for debugging
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+# For Render or local dev: dynamic port
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

@@ -79,15 +79,19 @@ def parse_kicad_schematic(s_expr):
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    print("/upload endpoint called")
     if "file" not in request.files:
+        print("No file part in request")
         return jsonify({"error": "No file part"}), 400
     file = request.files["file"]
     if file.filename == "":
+        print("No selected file")
         return jsonify({"error": "No selected file"}), 400
     filename = secure_filename(file.filename)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".kicad_sch", dir="/tmp") as tmp:
         file.save(tmp.name)
         tmp_path = tmp.name
+        print(f"File saved to {tmp_path}")
     return jsonify({"file_path": tmp_path})
 
 # Tool schema for OpenAI function calling
@@ -110,35 +114,48 @@ parse_kicad_tool = {
 }
 
 def parse_kicad_schematic_tool(file_path):
+    print(f"Parsing schematic at {file_path}")
     try:
         with open(file_path, "r") as f:
             schematic_text = f.read()
         s_expr = sexpdata.loads(schematic_text)
-        return parse_kicad_schematic(s_expr)
+        print("S-expression parsed successfully in tool")
+        result = parse_kicad_schematic(s_expr)
+        print(f"Parsed schematic result: {result}")
+        return result
     except Exception as e:
+        print(f"Error parsing schematic: {e}")
         return {"error": str(e)}
 
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
+        print("/chat endpoint called")
         data = request.get_json()
+        print(f"Incoming data: {data}")
         question = data.get("question")
         file_path = data.get("file_path")
         github_url = data.get("github_url")
         temp_file = None
         if not question or (not file_path and not github_url):
+            print("Missing question and file_path or github_url")
             return jsonify({"error": "Missing question and file_path or github_url"}), 400
 
         # If github_url is provided, download the file to a temp file
         if github_url and not file_path:
+            print(f"Downloading schematic from GitHub URL: {github_url}")
             resp = requests.get(github_url)
+            print(f"GitHub download status: {resp.status_code}")
             if resp.status_code != 200:
+                print(f"Failed to fetch schematic: {resp.status_code}")
                 return jsonify({"error": f"Failed to fetch schematic: {resp.status_code}"}), 400
             with tempfile.NamedTemporaryFile(delete=False, suffix=".kicad_sch", dir="/tmp") as tmp:
                 tmp.write(resp.content)
                 file_path = tmp.name
                 temp_file = tmp.name
+                print(f"Downloaded schematic saved to {file_path}")
 
+        print(f"Calling OpenAI with question: {question} and file_path: {file_path}")
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -148,45 +165,65 @@ def chat():
             tools=[parse_kicad_tool],
             tool_choice="auto"
         )
+        print(f"OpenAI initial response: {response}")
 
         tool_calls = getattr(response.choices[0].message, "tool_calls", [])
+        print(f"Tool calls: {tool_calls}")
         if tool_calls:
             for tool_call in tool_calls:
+                print(f"Processing tool call: {tool_call}")
                 if tool_call.function.name == "parse_kicad_schematic":
                     args = tool_call.function.arguments
+                    print(f"Tool call arguments: {args}")
                     if isinstance(args, str):
                         import json
                         args = json.loads(args)
                     parsed_data = parse_kicad_schematic_tool(args["file_path"])
+                    print(f"Parsed data to send to OpenAI: {parsed_data}")
+                    # Prepare assistant message with tool_calls
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [tool_call.to_dict() if hasattr(tool_call, 'to_dict') else tool_call]
+                    }
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": "parse_kicad_schematic",
+                        "content": json.dumps(parsed_data)
+                    }
+                    print(f"Sending follow-up to OpenAI with assistant_message: {assistant_message} and tool_message: {tool_message}")
                     followup = client.chat.completions.create(
                         model="gpt-4o",
                         messages=[
                             {"role": "user", "content": question},
                             {"role": "user", "content": f"The file is uploaded at {file_path}"},
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": "parse_kicad_schematic",
-                                "content": json.dumps(parsed_data)
-                            }
+                            assistant_message,
+                            tool_message
                         ]
                     )
+                    print(f"OpenAI follow-up response: {followup}")
                     answer = followup.choices[0].message.content
+                    print(f"Final answer: {answer}")
                     # Clean up temp file if created
                     if temp_file:
                         try:
                             os.remove(temp_file)
-                        except Exception:
-                            pass
+                            print(f"Temp file {temp_file} removed")
+                        except Exception as e:
+                            print(f"Error removing temp file: {e}")
                     return jsonify({"answer": answer})
         answer = response.choices[0].message.content
+        print(f"No tool call, returning answer: {answer}")
         if temp_file:
             try:
                 os.remove(temp_file)
-            except Exception:
-                pass
+                print(f"Temp file {temp_file} removed")
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
         return jsonify({"answer": answer})
     except Exception as e:
+        print("Exception in /chat endpoint:")
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

@@ -3,3 +3,4 @@ openai
 sexpdata
 requests
 flask-cors
+logging

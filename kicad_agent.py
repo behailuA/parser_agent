@@ -6,6 +6,14 @@ from flask_cors import CORS
 import openai
 import requests
 import sexpdata  # pip install sexpdata
+import logging  # Add logging
+
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 
@@ -132,10 +140,12 @@ CORS(app)  # Enable CORS for all domains
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
+    logger.debug(f"Received request data: {data}")  # Log incoming request
     user_message = data["message"]
     github_url = data["github_url"]
 
     # Step 1: Initial call with tool enabled
+    logger.info("Calling OpenAI ChatCompletion.create (initial call)")
     response = openai.ChatCompletion.create(
         model="gpt-4o",
         messages=[
@@ -148,15 +158,21 @@ def chat():
         }],
         tool_choice="auto"
     )
+    logger.debug(f"OpenAI initial response: {response}")
 
     # Step 2: If tool call is requested, run your parser and continue
     tool_calls = response.get("choices", [{}])[0].get("message", {}).get("tool_calls", [])
+    logger.debug(f"Tool calls extracted: {tool_calls}")
     if tool_calls:
         for tool_call in tool_calls:
+            logger.info(f"Processing tool call: {tool_call}")
             if tool_call["function"]["name"] == "parse_kicad_schematic":
                 arguments = json.loads(tool_call["function"]["arguments"])
+                logger.debug(f"Arguments for parser: {arguments}")
                 parsed_data = parse_kicad_schematic_from_github(arguments["github_url"])
+                logger.debug(f"Parsed schematic data: {parsed_data}")
                 # Step 3: Continue the conversation with the tool output
+                logger.info("Calling OpenAI ChatCompletion.create (followup)")
                 followup = openai.ChatCompletion.create(
                     model="gpt-4o",
                     messages=[
@@ -169,8 +185,10 @@ def chat():
                         }
                     ]
                 )
+                logger.debug(f"OpenAI followup response: {followup}")
                 return jsonify({"response": followup["choices"][0]["message"]["content"]})
     else:
+        logger.info("No tool calls found, returning initial response")
         return jsonify({"response": response["choices"][0]["message"]["content"]})
 
 if __name__ == "__main__":

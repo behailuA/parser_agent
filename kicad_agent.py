@@ -78,25 +78,34 @@ def parse_kicad_schematic(s_expr):
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
+        print("/chat endpoint called")
         data = request.get_json()
         github_url = data.get("github_url")
         question = data.get("question")
+        print(f"github_url: {github_url}")
+        print(f"question: {question}")
         if not github_url or not question:
+            print("Missing github_url or question")
             return jsonify({"error": "Missing github_url or question"}), 400
 
         # Download schematic file from GitHub
         resp = requests.get(github_url)
+        print(f"Fetched schematic, status: {resp.status_code}, length: {len(resp.text)}")
         if resp.status_code != 200:
+            print(f"Failed to fetch schematic: {resp.status_code}")
             return jsonify({"error": f"Failed to fetch schematic: {resp.status_code}"}), 400
         schematic_text = resp.text
 
         # Parse schematic S-expression
         try:
             s_expr = sexpdata.loads(schematic_text)
+            print("S-expression parsed successfully")
         except Exception as e:
+            print(f"Failed to parse schematic: {e}")
             return jsonify({"error": f"Failed to parse schematic: {str(e)}"}), 400
 
         summary = parse_kicad_schematic(s_expr)
+        print(f"Parsed summary: {summary}")
 
         # Prepare OpenAI function call
         system_prompt = (
@@ -116,6 +125,7 @@ def chat():
             max_tokens=512
         )
         answer = response.choices[0].message.content
+        print(f"OpenAI answer: {answer}")
 
         return jsonify({"answer": answer})
 

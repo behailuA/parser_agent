@@ -156,6 +156,11 @@ def chat():
                 print(f"Downloaded schematic saved to {file_path}")
 
         print(f"Calling OpenAI with question: {question} and file_path: {file_path}")
+        system_prompt = (
+            "You are a helpful assistant for KiCad schematic files. "
+            "You are given a summary of the schematic (title, components, nets). "
+            "If the user asks about connections or signals, use the 'nets' field."
+        )
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[

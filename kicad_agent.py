@@ -5,6 +5,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import openai
 import sexpdata
+import tempfile
+from werkzeug.utils import secure_filename
 
 # Use the new OpenAI API client
 client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -75,62 +77,116 @@ def parse_kicad_schematic(s_expr):
         "nets": nets
     }
 
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+    filename = secure_filename(file.filename)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".kicad_sch", dir="/tmp") as tmp:
+        file.save(tmp.name)
+        tmp_path = tmp.name
+    return jsonify({"file_path": tmp_path})
+
+# Tool schema for OpenAI function calling
+parse_kicad_tool = {
+    "type": "function",
+    "function": {
+        "name": "parse_kicad_schematic",
+        "description": "Extract components and connections from a KiCad schematic file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the uploaded KiCad schematic file"
+                }
+            },
+            "required": ["file_path"]
+        }
+    }
+}
+
+def parse_kicad_schematic_tool(file_path):
+    try:
+        with open(file_path, "r") as f:
+            schematic_text = f.read()
+        s_expr = sexpdata.loads(schematic_text)
+        return parse_kicad_schematic(s_expr)
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        print("/chat endpoint called")
         data = request.get_json()
-        github_url = data.get("github_url")
         question = data.get("question")
-        print(f"github_url: {github_url}")
-        print(f"question: {question}")
-        if not github_url or not question:
-            print("Missing github_url or question")
-            return jsonify({"error": "Missing github_url or question"}), 400
+        file_path = data.get("file_path")
+        github_url = data.get("github_url")
+        temp_file = None
+        if not question or (not file_path and not github_url):
+            return jsonify({"error": "Missing question and file_path or github_url"}), 400
 
-        # Download schematic file from GitHub
-        resp = requests.get(github_url)
-        print(f"Fetched schematic, status: {resp.status_code}, length: {len(resp.text)}")
-        if resp.status_code != 200:
-            print(f"Failed to fetch schematic: {resp.status_code}")
-            return jsonify({"error": f"Failed to fetch schematic: {resp.status_code}"}), 400
-        schematic_text = resp.text
-
-        # Parse schematic S-expression
-        try:
-            s_expr = sexpdata.loads(schematic_text)
-            print("S-expression parsed successfully")
-        except Exception as e:
-            print(f"Failed to parse schematic: {e}")
-            return jsonify({"error": f"Failed to parse schematic: {str(e)}"}), 400
-
-        summary = parse_kicad_schematic(s_expr)
-        print(f"Parsed summary: {summary}")
-
-        # Prepare OpenAI function call
-        system_prompt = (
-            "You are a helpful assistant for KiCad schematic files. "
-            "You are given a summary of the schematic (title, components, nets). "
-            "Answer the user's question using this information."
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Schematic summary: {summary}\n\nQuestion: {question}"}
-        ]
+        # If github_url is provided, download the file to a temp file
+        if github_url and not file_path:
+            resp = requests.get(github_url)
+            if resp.status_code != 200:
+                return jsonify({"error": f"Failed to fetch schematic: {resp.status_code}"}), 400
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".kicad_sch", dir="/tmp") as tmp:
+                tmp.write(resp.content)
+                file_path = tmp.name
+                temp_file = tmp.name
 
         response = client.chat.completions.create(
-            model="gpt-4o",  # or "gpt-3.5-turbo"
-            messages=messages,
-            temperature=0.2,
-            max_tokens=512
+            model="gpt-4o",
+            messages=[
+                {"role": "user", "content": question},
+                {"role": "user", "content": f"The file is uploaded at {file_path}"}
+            ],
+            tools=[parse_kicad_tool],
+            tool_choice="auto"
         )
+
+        tool_calls = getattr(response.choices[0].message, "tool_calls", [])
+        if tool_calls:
+            for tool_call in tool_calls:
+                if tool_call.function.name == "parse_kicad_schematic":
+                    args = tool_call.function.arguments
+                    if isinstance(args, str):
+                        import json
+                        args = json.loads(args)
+                    parsed_data = parse_kicad_schematic_tool(args["file_path"])
+                    followup = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "user", "content": question},
+                            {"role": "user", "content": f"The file is uploaded at {file_path}"},
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": "parse_kicad_schematic",
+                                "content": json.dumps(parsed_data)
+                            }
+                        ]
+                    )
+                    answer = followup.choices[0].message.content
+                    # Clean up temp file if created
+                    if temp_file:
+                        try:
+                            os.remove(temp_file)
+                        except Exception:
+                            pass
+                    return jsonify({"answer": answer})
         answer = response.choices[0].message.content
-        print(f"OpenAI answer: {answer}")
-
+        if temp_file:
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
         return jsonify({"answer": answer})
-
     except Exception as e:
-        # Log the full traceback for debugging
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
